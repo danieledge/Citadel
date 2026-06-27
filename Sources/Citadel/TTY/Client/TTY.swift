@@ -264,6 +264,9 @@ extension SSHClient {
 
     enum CommandMode {
         case pty(SSHChannelRequestEvent.PseudoTerminalRequest), tty(command: String?), command(String)
+        // Allocate a PTY *and* exec a command on it (the `ssh -t host 'cmd'` shape) — runs the
+        // command AS the channel program, with no interactive shell to type into.
+        case ptyExec(SSHChannelRequestEvent.PseudoTerminalRequest, command: String)
     }
 
     internal func _executeCommandStream(
@@ -335,6 +338,12 @@ extension SSHClient {
                 command: command,
                 wantReply: true
             ))
+        case .ptyExec(let request, let command):
+            try await channel.triggerUserOutboundEvent(request)
+            try await channel.triggerUserOutboundEvent(SSHChannelRequestEvent.ExecRequest(
+                command: command,
+                wantReply: true
+            ))
         }
         
         return (channel, stream)
@@ -355,6 +364,46 @@ extension SSHClient {
         let (channel, output) = try await _executeCommandStream(
             environment: environment,
             mode: .pty(request)
+        )
+
+        func close() async throws {
+            try await channel.close()
+        }
+
+        do {
+            let inbound = TTYOutput(sequence: output)
+            try await perform(inbound, TTYStdinWriter(channel: channel))
+            try await close()
+        } catch {
+            try await close()
+            throw error
+        }
+    }
+
+    /// Creates a pseudo-terminal (PTY) session that runs `command` directly as the channel
+    /// program — the `ssh -t host 'command'` shape — instead of an interactive login shell.
+    ///
+    /// Unlike `withPTY(_:environment:perform:)` (pty + shell, into which you'd have to *type*
+    /// a command and race the shell's state), this allocates the PTY and `exec`s the command,
+    /// so there is no shell prompt to race and nothing leaks into a running program. Ideal for
+    /// running a terminal multiplexer (e.g. `tmux new -A -s main`) as the session itself.
+    ///
+    /// - Parameters:
+    ///   - request: PTY configuration parameters
+    ///   - command: Command line to exec on the PTY (run via the user's login shell by sshd)
+    ///   - environment: Array of environment variables to set for the session
+    ///   - perform: Closure that receives TTY input/output streams
+    /// - Throws: Any errors that occur during PTY setup or operation
+    @available(macOS 15.0, *)
+    public func withPTY(
+        _ request: SSHChannelRequestEvent.PseudoTerminalRequest,
+        executing command: String,
+        environment: [SSHChannelRequestEvent.EnvironmentRequest] = [],
+        perform: (_ inbound: TTYOutput, _ outbound: TTYStdinWriter) async throws -> Void
+    ) async throws {
+        let (channel, output) = try await _executeCommandStream(
+            environment: environment,
+            mode: .ptyExec(request, command: command)
         )
 
         func close() async throws {
