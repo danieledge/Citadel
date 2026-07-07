@@ -36,6 +36,11 @@ public final class SSHAuthenticationMethod: NIOSSHClientUserAuthenticationDelega
         self.allImplementations = [.user(username, offer: offer)]
         self.implementations = allImplementations
     }
+
+    private init(implementations: [Implementation]) {
+        self.allImplementations = implementations
+        self.implementations = implementations
+    }
     
     internal init(
         custom: NIOSSHClientUserAuthenticationDelegate
@@ -49,7 +54,15 @@ public final class SSHAuthenticationMethod: NIOSSHClientUserAuthenticationDelega
     ///  - username: The username to authenticate with.
     /// - password: The password to authenticate with.
     public static func passwordBased(username: String, password: String) -> SSHAuthenticationMethod {
-        let method = SSHAuthenticationMethod(username: username, offer: .password(.init(password: password)))
+        // Offer password first, then keyboard-interactive with the SAME password (RFC 4256). This
+        // covers BOTH cases: the server not advertising `password` at all, AND advertising it but
+        // rejecting it (UniFi/UDM, hardened sshd) — nextAuthenticationType skips unavailable methods
+        // and the KI attempt is also tried after a password rejection.
+        let ki: NIOSSHUserAuthenticationOffer.Offer = .keyboardInteractive(.init(delegate: PasswordKeyboardInteractiveDelegate(password: password)))
+        let method = SSHAuthenticationMethod(implementations: [
+            .user(username, offer: .password(.init(password: password))),
+            .user(username, offer: ki),
+        ])
         method.enableKeyboardInteractiveFallback = true
         return method
     }
@@ -112,46 +125,29 @@ public final class SSHAuthenticationMethod: NIOSSHClientUserAuthenticationDelega
             return
         }
         
-        let implementation = implementations.removeFirst()
-
-        switch implementation {
-        case .user(let username, offer: let offer):
-            switch offer {
-            case .password(let passwordOffer):
-                if !availableMethods.contains(.password) {
-                    // Server doesn't offer `password` — fall back to keyboard-interactive with the
-                    // same password when the server offers it (the UniFi/UDM / hardened-sshd case).
-                    if enableKeyboardInteractiveFallback && availableMethods.contains(.keyboardInteractive) {
-                        let kiDelegate = PasswordKeyboardInteractiveDelegate(password: passwordOffer.password)
-                        let kiOffer: NIOSSHUserAuthenticationOffer.Offer = .keyboardInteractive(.init(delegate: kiDelegate))
-                        nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: username, serviceName: "", offer: kiOffer))
-                        return
-                    }
-                    nextChallengePromise.fail(SSHClientError.unsupportedPasswordAuthentication)
-                    return
+        // Try queued methods in order, SKIPPING any the server doesn't advertise, until one matches
+        // or we run out. This is what lets password → keyboard-interactive fallback work whether the
+        // server omits password or advertises-then-rejects it.
+        while let implementation = implementations.first {
+            implementations.removeFirst()
+            switch implementation {
+            case .user(let username, offer: let offer):
+                let available: Bool
+                switch offer {
+                case .password:          available = availableMethods.contains(.password)
+                case .keyboardInteractive: available = availableMethods.contains(.keyboardInteractive)
+                case .hostBased:         available = availableMethods.contains(.hostBased)
+                case .privateKey:        available = availableMethods.contains(.publicKey)
+                case .none:              available = true
                 }
-            case .keyboardInteractive:
-                guard availableMethods.contains(.keyboardInteractive) else {
-                    nextChallengePromise.fail(SSHClientError.allAuthenticationOptionsFailed)
-                    return
-                }
-            case .hostBased:
-                guard availableMethods.contains(.hostBased) else {
-                    nextChallengePromise.fail(SSHClientError.unsupportedHostBasedAuthentication)
-                    return
-                }
-            case .privateKey:
-                guard availableMethods.contains(.publicKey) else {
-                    nextChallengePromise.fail(SSHClientError.unsupportedPrivateKeyAuthentication)
-                    return
-                }
-            case .none:
-                ()
+                if !available { continue }   // server doesn't offer this method — try the next queued one
+                nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: username, serviceName: "", offer: offer))
+                return
+            case .custom(let implementation):
+                implementation.nextAuthenticationType(availableMethods: availableMethods, nextChallengePromise: nextChallengePromise)
+                return
             }
-            
-            nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: username, serviceName: "", offer: offer))
-        case .custom(let implementation):
-            implementation.nextAuthenticationType(availableMethods: availableMethods, nextChallengePromise: nextChallengePromise)
         }
+        nextChallengePromise.fail(SSHClientError.allAuthenticationOptionsFailed)
     }
 }
