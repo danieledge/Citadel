@@ -19,7 +19,7 @@ let package = Package(
         // .package(path: "/Users/joannisorlandos/git/joannis/swift-nio-ssh"),
         // Our pinned fork of Wellz26/swift-nio-ssh + keyboard-interactive auth (RFC 4256),
         // reviewed at this commit. Restores keyboard-interactive support NIOSSH lacks.
-        .package(url: "https://github.com/danieledge/swift-nio-ssh.git", revision: "24f557a417d706712b24def440c74e3d895beae8"),
+        .package(url: "https://github.com/danieledge/swift-nio-ssh.git", revision: "c554959f121a41c36935deb75c91d07c29693051"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.81.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.0.0"),
         .package(url: "https://github.com/attaswift/BigInt.git", from: "5.2.0"),
