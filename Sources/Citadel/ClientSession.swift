@@ -68,6 +68,10 @@ final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
     private let promise: EventLoopPromise<Void>
     let logger = Logger(label: "nl.orlandos.citadel.handshake")
 
+    /// SSH_MSG_USERAUTH_BANNER text the server sent during authentication (RFC 4252 §5.4),
+    /// accumulated (a server may send several). Surfaced so clients can display it like OpenSSH.
+    let issueBanner = NIOLockedValueBox<String>("")
+
     /// A future that will be fulfilled when the handshake is complete.
     public var authenticated: EventLoopFuture<Void> {
         promise.futureResult
@@ -83,6 +87,9 @@ final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let banner = event as? NIOUserAuthBannerEvent {
+            issueBanner.withLockedValue { $0 += banner.message }
+        }
         if event is UserAuthSuccessEvent {
             self.promise.succeed(())
         }
@@ -126,11 +133,14 @@ final class SSHClientSession: Sendable {
     let channel: Channel
     let sshHandler: NIOLoopBoundBox<NIOSSHHandler>
     let inboundChannelHandler: SSHClientInboundChannelHandler
-    
-    init(channel: Channel, inboundChannelHandler: SSHClientInboundChannelHandler, sshHandler: NIOSSHHandler) {
+    /// The server's authentication banner (SSH_MSG_USERAUTH_BANNER), if any.
+    let issueBanner: String?
+
+    init(channel: Channel, inboundChannelHandler: SSHClientInboundChannelHandler, sshHandler: NIOSSHHandler, issueBanner: String? = nil) {
         self.channel = channel
         self.inboundChannelHandler = inboundChannelHandler
         self.sshHandler = NIOLoopBoundBox(sshHandler, eventLoop: channel.eventLoop)
+        self.issueBanner = issueBanner
     }
     
     /// Creates a new SSH session on the given channel. This allows you to use an existing channel for the SSH session.
@@ -227,11 +237,13 @@ final class SSHClientSession: Sendable {
         
         return try await bootstrap.connect(host: settings.host, port: settings.port).flatMap { channel in
             channel.pipeline.handler(type: ClientHandshakeHandler.self).flatMap { handshakeHandler in
-                handshakeHandler.authenticated
-            }.flatMap {
-                channel.pipeline.handler(type: NIOSSHHandler.self)
-            }.map { sshHandler in
-                SSHClientSession(channel: channel, inboundChannelHandler: inboundChannelHandler, sshHandler: sshHandler)
+                handshakeHandler.authenticated.flatMap {
+                    channel.pipeline.handler(type: NIOSSHHandler.self).map { sshHandler in
+                        // Auth is complete, so any USERAUTH_BANNER has arrived — carry it onto the session.
+                        let banner = handshakeHandler.issueBanner.withLockedValue { $0 }
+                        return SSHClientSession(channel: channel, inboundChannelHandler: inboundChannelHandler, sshHandler: sshHandler, issueBanner: banner.isEmpty ? nil : banner)
+                    }
+                }
             }
         }.get()
     }

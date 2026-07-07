@@ -122,6 +122,13 @@ public final class SSHClient {
     public var isConnected: Bool {
         session.channel.isActive
     }
+
+    /// The server's authentication banner (SSH_MSG_USERAUTH_BANNER) captured during login, if the
+    /// server sent one — e.g. a legal notice / MOTD shown by OpenSSH before the shell. Display it to
+    /// the user like `ssh` does; it never arrives on the shell's stdout.
+    public var issueBanner: String? {
+        session.issueBanner
+    }
     
     /// The event loop that this SSH connection is running on.
     public var eventLoop: EventLoop {
