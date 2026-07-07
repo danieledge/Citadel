@@ -1,19 +1,32 @@
 import NIO
 import NIOSSH
 import Crypto
+import NIOConcurrencyHelpers
 
 /// Answers keyboard-interactive challenges with a stored password — the RFC 4256 fallback for
 /// servers with `PasswordAuthentication no` + `KbdInteractiveAuthentication yes` (UniFi/UDM,
 /// cPanel, hardened sshd). Single-prompt servers only; a true multi-prompt (password + OTP) 2FA
 /// server would need an interactive delegate.
+///
+/// Also captures the challenge's `name`/`instruction` text into `bannerBox`: servers frequently
+/// deliver the login notice/MOTD there (rather than as a USERAUTH_BANNER), and it would otherwise
+/// be lost. The client can display it like `ssh` does.
 final class PasswordKeyboardInteractiveDelegate: NIOSSHKeyboardInteractiveDelegate {
     let password: String
-    init(password: String) { self.password = password }
+    let bannerBox: NIOLockedValueBox<String>
+    init(password: String, bannerBox: NIOLockedValueBox<String>) {
+        self.password = password
+        self.bannerBox = bannerBox
+    }
     func respondToKeyboardInteractiveChallenge(
         name: String,
         instruction: String,
         prompts: [NIOSSHKeyboardInteractivePrompt]
     ) -> [String] {
+        let extra = [name, instruction].filter { !$0.isEmpty }.joined(separator: "\n")
+        if !extra.isEmpty {
+            bannerBox.withLockedValue { $0 += ($0.isEmpty ? "" : "\n") + extra }
+        }
         return prompts.map { _ in self.password }
     }
 }
@@ -28,6 +41,14 @@ public final class SSHAuthenticationMethod: NIOSSHClientUserAuthenticationDelega
     private let allImplementations: [Implementation]
     private var implementations: [Implementation]
     private var enableKeyboardInteractiveFallback: Bool = false
+
+    /// Login notice/MOTD captured from a keyboard-interactive challenge's name/instruction, if any.
+    private(set) var capturedBanner = NIOLockedValueBox<String>("")
+    /// The captured keyboard-interactive banner text (nil if the server sent none). Read after connect.
+    public var receivedBanner: String? {
+        let b = capturedBanner.withLockedValue { $0 }
+        return b.isEmpty ? nil : b
+    }
     
     internal init(
         username: String,
@@ -58,12 +79,14 @@ public final class SSHAuthenticationMethod: NIOSSHClientUserAuthenticationDelega
         // covers BOTH cases: the server not advertising `password` at all, AND advertising it but
         // rejecting it (UniFi/UDM, hardened sshd) — nextAuthenticationType skips unavailable methods
         // and the KI attempt is also tried after a password rejection.
-        let ki: NIOSSHUserAuthenticationOffer.Offer = .keyboardInteractive(.init(delegate: PasswordKeyboardInteractiveDelegate(password: password)))
+        let bannerBox = NIOLockedValueBox<String>("")
+        let ki: NIOSSHUserAuthenticationOffer.Offer = .keyboardInteractive(.init(delegate: PasswordKeyboardInteractiveDelegate(password: password, bannerBox: bannerBox)))
         let method = SSHAuthenticationMethod(implementations: [
             .user(username, offer: .password(.init(password: password))),
             .user(username, offer: ki),
         ])
         method.enableKeyboardInteractiveFallback = true
+        method.capturedBanner = bannerBox   // share the box the KI delegate writes into
         return method
     }
 
