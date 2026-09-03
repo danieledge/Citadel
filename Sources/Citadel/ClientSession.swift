@@ -192,7 +192,10 @@ final class SSHClientSession: Sendable {
             option.apply(to: &clientConfiguration)
         }
         
-        do {
+        // Run the pipeline mutation ON the channel's event loop. `syncOperations` requires the caller
+        // be on the loop (it asserts, trapping in debug builds), but a connect(on:) caller whose channel
+        // was created off-loop — e.g. NIOTransportServices via async/await — is not. Hop with submit().
+        return channel.eventLoop.submit {
             try channel.pipeline.syncOperations.addHandlers(
                 NIOSSHHandler(
                     role: .client(clientConfiguration),
@@ -203,9 +206,6 @@ final class SSHClientSession: Sendable {
                 ),
                 handshakeHandler
             )
-            return channel.eventLoop.makeSucceededVoidFuture()
-        } catch {
-            return channel.eventLoop.makeFailedFuture(error)
         }
     }
 
