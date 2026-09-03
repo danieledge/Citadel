@@ -172,7 +172,9 @@ public final class SSHClient {
         )
     }
 
-    /// Connects to an SSH server.
+    /// Connects to an SSH server on a channel the CALLER owns (an existing socket / proxy channel).
+    /// Ownership stays with the caller: on a failed handshake this does NOT close `channel` (unlike
+    /// `connect(to:)`, which created the channel and therefore closes it) — close it yourself.
     /// - settings: The settings to use for the connection.
     /// - Returns: An SSH client.
     public static func connect(
@@ -185,11 +187,13 @@ public final class SSHClient {
             inboundChannelHandler: inboundChannelHandler,
             settings: settings
         ).get()
-        
+
         let sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
         let handshakeHandler = try await channel.pipeline.handler(type: ClientHandshakeHandler.self).get()
         let session = try await handshakeHandler.authenticated.map {
-            SSHClientSession(channel: channel, inboundChannelHandler: inboundChannelHandler, sshHandler: sshHandler)
+            // Auth is complete, so any USERAUTH_BANNER has arrived — carry it onto the session.
+            let banner = handshakeHandler.issueBanner.withLockedValue { $0 }
+            return SSHClientSession(channel: channel, inboundChannelHandler: inboundChannelHandler, sshHandler: sshHandler, issueBanner: banner.isEmpty ? nil : banner)
         }.get()
 
         return SSHClient(
@@ -280,8 +284,14 @@ public final class SSHClient {
     /// - protocolOptions: The protocol options to use. See `SSHProtocolOption` for more information.
     /// - group: The event loop group to use. Defaults to a single-threaded event loop group.
     /// - channelHandlers: Pass in an array of channel prehandlers that execute first. Default empty array
-    /// - connectTimeout: Pass in the time before the connection times out. Default 30 seconds.
-    /// - Returns: An SSH client.
+    /// - connectTimeout: Pass in the time before the TCP connection times out. Default 30 seconds.
+    /// - loginTimeout: Bound on the SSH handshake (KEX + auth) after the TCP connect. Default 10 seconds.
+    ///   On expiry the connect throws `ChannelError.connectTimeout` and the connection is closed.
+    /// - onChannel: Receives the `Channel` before the TCP connect completes, so the caller can abort an
+    ///   in-flight handshake with `channel.close()` (NIO's connect ignores Task cancellation). May fire
+    ///   more than once (Happy Eyeballs). See `SSHClientSettings.onChannel`.
+    /// - Returns: An SSH client. On ANY failure after the TCP connect the underlying channel has
+    ///   already been closed — nothing is left half-open on the server.
     public static func connect(
         host: String,
         port: Int = 22,
@@ -292,7 +302,9 @@ public final class SSHClient {
         protocolOptions: Set<SSHProtocolOption> = [],
         group: MultiThreadedEventLoopGroup = .singleton,
         channelHandlers: [ChannelHandler] = [],
-        connectTimeout:TimeAmount = .seconds(30)
+        connectTimeout:TimeAmount = .seconds(30),
+        loginTimeout: TimeAmount = .seconds(10),
+        onChannel: (@Sendable (Channel) -> Void)? = nil
     ) async throws -> SSHClient {
         let session = try await SSHClientSession.connect(
             host: host,
@@ -303,7 +315,9 @@ public final class SSHClient {
             protocolOptions: protocolOptions,
             group: group,
             channelHandlers: channelHandlers,
-            connectTimeout: connectTimeout
+            connectTimeout: connectTimeout,
+            loginTimeout: loginTimeout,
+            onChannel: onChannel
         )
         
         let client = SSHClient(

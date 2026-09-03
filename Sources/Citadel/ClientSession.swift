@@ -114,7 +114,22 @@ public struct SSHClientSettings: Sendable {
     public var protocolOptions: Set<SSHProtocolOption> = []
     public var group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton
     internal var channelHandlers: [ChannelHandler & Sendable] = []
+    /// Bounds the TCP connect (name resolution + connect).
     public var connectTimeout: TimeAmount = .seconds(30)
+    /// Bounds the SSH handshake (version exchange + key exchange + user authentication), measured
+    /// from channel initialisation. When it elapses the connect fails with
+    /// `ChannelError.connectTimeout(loginTimeout)` and — for `SSHClient.connect(to:)` /
+    /// `connect(host:...)` — the underlying channel is closed, so the half-open connection does not
+    /// linger unauthenticated on the server (sshd counts those against `MaxStartups` until its
+    /// `LoginGraceTime` reaps them). Previously hard-coded to 10 s.
+    public var loginTimeout: TimeAmount = .seconds(10)
+    /// Invoked with the freshly created `Channel` BEFORE the TCP connect completes (from the
+    /// bootstrap's channel initialiser, on the channel's event loop — keep it quick). Lets a caller
+    /// hold the channel so an in-flight handshake can be aborted with `channel.close()`: NIO's connect
+    /// ignores Task cancellation, so without a handle a caller that gives up on a slow handshake has
+    /// no way to release the server-side connection. May be called more than once per connect when
+    /// the host resolves to several addresses (Happy Eyeballs) — close every channel you were given.
+    public var onChannel: (@Sendable (Channel) -> Void)? = nil
 
     public init(
         host: String,
@@ -179,7 +194,7 @@ final class SSHClientSession: Sendable {
     ) -> EventLoopFuture<Void> {
         let handshakeHandler = ClientHandshakeHandler(
             eventLoop: channel.eventLoop,
-            loginTimeout: .seconds(10)
+            loginTimeout: settings.loginTimeout
         )
         var clientConfiguration = SSHClientConfiguration(
             userAuthDelegate: settings.authenticationMethod(),
@@ -227,25 +242,37 @@ final class SSHClientSession: Sendable {
             option.apply(to: &clientConfiguration)
         }
         
+        let onChannel = settings.onChannel
         let bootstrap = ClientBootstrap(group: eventLoop).channelInitializer { channel in
+            onChannel?(channel)   // hand the caller an abort handle before any byte is on the wire
             return Self.addHandlers(on: channel, inboundChannelHandler: inboundChannelHandler, settings: settings)
         }
         .connectTimeout(settings.connectTimeout)
 //        .channelOption(ChannelOptions.autoRead, value: true)
         .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
         .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
-        
-        return try await bootstrap.connect(host: settings.host, port: settings.port).flatMap { channel in
-            channel.pipeline.handler(type: ClientHandshakeHandler.self).flatMap { handshakeHandler in
-                handshakeHandler.authenticated.flatMap {
-                    channel.pipeline.handler(type: NIOSSHHandler.self).map { sshHandler in
-                        // Auth is complete, so any USERAUTH_BANNER has arrived — carry it onto the session.
-                        let banner = handshakeHandler.issueBanner.withLockedValue { $0 }
-                        return SSHClientSession(channel: channel, inboundChannelHandler: inboundChannelHandler, sshHandler: sshHandler, issueBanner: banner.isEmpty ? nil : banner)
-                    }
-                }
-            }
-        }.get()
+
+        // The TCP connect either yields a live channel or fails having already released its socket
+        // (NIO closes losing/failed Happy Eyeballs attempts itself).
+        let channel = try await bootstrap.connect(host: settings.host, port: settings.port).get()
+        do {
+            let handshakeHandler = try await channel.pipeline.handler(type: ClientHandshakeHandler.self).get()
+            try await handshakeHandler.authenticated.get()
+            let sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
+            // Auth is complete, so any USERAUTH_BANNER has arrived — carry it onto the session.
+            let banner = handshakeHandler.issueBanner.withLockedValue { $0 }
+            return SSHClientSession(channel: channel, inboundChannelHandler: inboundChannelHandler, sshHandler: sshHandler, issueBanner: banner.isEmpty ? nil : banner)
+        } catch {
+            // The handshake failed (login timeout, host-key refusal, authentication rejected, KEX or
+            // protocol error) but the TCP channel is still open: `ClientHandshakeHandler` only fails
+            // its promise, NIOSSHHandler only closes on an inbound DISCONNECT, and NIO does not close a
+            // channel on an unhandled error. Left alone, the connection sits half-open on the server —
+            // unauthenticated, counting against sshd's MaxStartups — until LoginGraceTime reaps it,
+            // and the caller has no handle to close it (nothing was returned). Close it here so the
+            // FIN goes out immediately and the failure releases the server-side slot at once.
+            channel.close(promise: nil)
+            throw error
+        }
     }
     
     /// Creates a new SSH session on a new channel. This will connect to the given host and port.
@@ -259,6 +286,8 @@ final class SSHClientSession: Sendable {
     /// - group: The event loop group to use, will use a new group with one thread if not specified.
     /// - channelHandlers: Pass in an array of channel prehandlers that execute first. Default empty array
     /// - connectTimeout: Pass in the time before the connection times out. Default 30 seconds.
+    /// - loginTimeout: Bound on the SSH handshake after the TCP connect. Default 10 seconds.
+    /// - onChannel: Receives the channel before connecting (abort handle). See `SSHClientSettings.onChannel`.
     static func connect(
         host: String,
         port: Int = 22,
@@ -268,7 +297,9 @@ final class SSHClientSession: Sendable {
         protocolOptions: Set<SSHProtocolOption> = [],
         group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
         channelHandlers: [ChannelHandler] = [],
-        connectTimeout: TimeAmount = .seconds(30)
+        connectTimeout: TimeAmount = .seconds(30),
+        loginTimeout: TimeAmount = .seconds(10),
+        onChannel: (@Sendable (Channel) -> Void)? = nil
     ) async throws -> SSHClientSession {
         var settings = SSHClientSettings(
             host: host,
@@ -282,7 +313,9 @@ final class SSHClientSession: Sendable {
         settings.group = group
         settings.channelHandlers = channelHandlers
         settings.connectTimeout = connectTimeout
-        
+        settings.loginTimeout = loginTimeout
+        settings.onChannel = onChannel
+
         return try await connect(
             settings: settings
         )
