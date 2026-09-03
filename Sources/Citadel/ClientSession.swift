@@ -235,7 +235,7 @@ final class SSHClientSession: Sendable {
         .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
         .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
         
-        return try await bootstrap.connect(host: settings.host, port: settings.port).flatMap { channel in
+        return try await bootstrap.connect(host: settings.host, port: settings.port).flatMap { channel -> EventLoopFuture<SSHClientSession> in
             channel.pipeline.handler(type: ClientHandshakeHandler.self).flatMap { handshakeHandler in
                 handshakeHandler.authenticated.flatMap {
                     channel.pipeline.handler(type: NIOSSHHandler.self).map { sshHandler in
@@ -244,6 +244,15 @@ final class SSHClientSession: Sendable {
                         return SSHClientSession(channel: channel, inboundChannelHandler: inboundChannelHandler, sshHandler: sshHandler, issueBanner: banner.isEmpty ? nil : banner)
                     }
                 }
+            }.flatMapError { error in
+                // Post-TCP handshake failure (login timeout / host-key refusal / auth rejection / KEX or
+                // protocol error) otherwise leaves the TCP channel OPEN: NIOSSHHandler only closes on an
+                // inbound DISCONNECT, NIO doesn't close a channel on an unhandled error, and the caller
+                // gets no handle back on failure. Left alone the connection sits half-open on the server,
+                // unauthenticated, counting against sshd's MaxStartups until LoginGraceTime reaps it. Close
+                // it here so the FIN goes out at once and the server releases the slot immediately.
+                channel.close(promise: nil)
+                return channel.eventLoop.makeFailedFuture(error)
             }
         }.get()
     }
