@@ -139,15 +139,48 @@ public final class SSHAuthenticationMethod: NIOSSHClientUserAuthenticationDelega
         return SSHAuthenticationMethod(custom: auth)
     }
     
+    /// Progress narration for connection UIs: which methods the server offers, which one is being
+    /// tried, which were skipped or rejected. Human-readable, one line per call, on the event loop.
+    public var onEvent: (@Sendable (String) -> Void)?
+    private var offersMade = 0
+
+    private static func describe(_ methods: NIOSSHAvailableUserAuthenticationMethods) -> String {
+        var names: [String] = []
+        if methods.contains(.publicKey) { names.append("publickey") }
+        if methods.contains(.password) { names.append("password") }
+        if methods.contains(.keyboardInteractive) { names.append("keyboard-interactive") }
+        if methods.contains(.hostBased) { names.append("hostbased") }
+        return names.isEmpty ? "(none)" : names.joined(separator: ",")
+    }
+
+    private static func describe(_ offer: NIOSSHUserAuthenticationOffer.Offer) -> String {
+        switch offer {
+        case .password:            return "password"
+        case .keyboardInteractive: return "keyboard-interactive"
+        case .hostBased:           return "hostbased"
+        case .privateKey:          return "publickey"
+        case .none:                return "none"
+        }
+    }
+
     public func nextAuthenticationType(
         availableMethods: NIOSSHAvailableUserAuthenticationMethods,
         nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
     ) {
+        // NIOSSH calls this once to start, and again after each rejected offer.
+        if offersMade == 0 {
+            onEvent?("server accepts: \(Self.describe(availableMethods))")
+        } else {
+            onEvent?("server rejected the previous method; remaining: \(Self.describe(availableMethods))")
+        }
+        offersMade += 1
+
         if implementations.isEmpty {
+            onEvent?("no authentication methods left to try")
             nextChallengePromise.fail(SSHClientError.allAuthenticationOptionsFailed)
             return
         }
-        
+
         // Try queued methods in order, SKIPPING any the server doesn't advertise, until one matches
         // or we run out. This is what lets password → keyboard-interactive fallback work whether the
         // server omits password or advertises-then-rejects it.
@@ -163,14 +196,20 @@ public final class SSHAuthenticationMethod: NIOSSHClientUserAuthenticationDelega
                 case .privateKey:        available = availableMethods.contains(.publicKey)
                 case .none:              available = true
                 }
-                if !available { continue }   // server doesn't offer this method — try the next queued one
+                if !available {   // server doesn't offer this method — try the next queued one
+                    onEvent?("skipping \(Self.describe(offer)) (not offered by the server)")
+                    continue
+                }
+                onEvent?("trying \(Self.describe(offer)) as \(username)")
                 nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: username, serviceName: "", offer: offer))
                 return
             case .custom(let implementation):
+                onEvent?("trying custom authentication delegate")
                 implementation.nextAuthenticationType(availableMethods: availableMethods, nextChallengePromise: nextChallengePromise)
                 return
             }
         }
+        onEvent?("no authentication methods left to try")
         nextChallengePromise.fail(SSHClientError.allAuthenticationOptionsFailed)
     }
 }

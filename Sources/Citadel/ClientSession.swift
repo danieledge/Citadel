@@ -62,10 +62,24 @@ final class SSHClientInboundChannelHandler: Sendable {
     }
 }
 
+/// Milestones of an SSH client handshake, reported through `SSHClientSettings.onHandshakeEvent` so a
+/// client can show what a connect is actually doing (and where a slow one is stuck). Delivered on the
+/// channel's event loop — keep handlers quick and hop threads yourself.
+public enum SSHHandshakeEvent: Sendable {
+    /// The TCP connection is up and our version string is on the wire; the server's version
+    /// exchange and key exchange follow.
+    case tcpConnected
+    /// SSH_MSG_USERAUTH_BANNER text (RFC 4252 §5.4); may arrive more than once.
+    case banner(String)
+    /// SSH_MSG_USERAUTH_SUCCESS — the handshake is complete.
+    case authenticated
+}
+
 final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
     typealias InboundIn = Any
 
     private let promise: EventLoopPromise<Void>
+    private let onEvent: (@Sendable (SSHHandshakeEvent) -> Void)?
     let logger = Logger(label: "nl.orlandos.citadel.handshake")
 
     /// SSH_MSG_USERAUTH_BANNER text the server sent during authentication (RFC 4252 §5.4),
@@ -77,22 +91,33 @@ final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
         promise.futureResult
     }
 
-    init(eventLoop: EventLoop, loginTimeout: TimeAmount) {
+    init(eventLoop: EventLoop, loginTimeout: TimeAmount, onEvent: (@Sendable (SSHHandshakeEvent) -> Void)? = nil) {
         let promise = eventLoop.makePromise(of: Void.self)
         self.promise = promise
+        self.onEvent = onEvent
 
         eventLoop.scheduleTask(deadline: .now() + loginTimeout) {
             promise.fail(ChannelError.connectTimeout(loginTimeout))
         }
     }
 
+    func channelActive(context: ChannelHandlerContext) {
+        // NIOSSHHandler (ahead of us in the pipeline) fires channelActive only after it has written
+        // the client version string, so this marks "TCP up, SSH version exchange started".
+        onEvent?(.tcpConnected)
+        context.fireChannelActive()
+    }
+
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if let banner = event as? NIOUserAuthBannerEvent {
             issueBanner.withLockedValue { $0 += banner.message }
+            onEvent?(.banner(banner.message))
         }
         if event is UserAuthSuccessEvent {
+            onEvent?(.authenticated)
             self.promise.succeed(())
         }
+        context.fireUserInboundEventTriggered(event)
     }
 
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
@@ -130,6 +155,9 @@ public struct SSHClientSettings: Sendable {
     /// no way to release the server-side connection. May be called more than once per connect when
     /// the host resolves to several addresses (Happy Eyeballs) — close every channel you were given.
     public var onChannel: (@Sendable (Channel) -> Void)? = nil
+    /// Handshake milestones (TCP up / banner / authenticated) as they happen — see `SSHHandshakeEvent`.
+    /// Called on the channel's event loop.
+    public var onHandshakeEvent: (@Sendable (SSHHandshakeEvent) -> Void)? = nil
 
     public init(
         host: String,
@@ -194,7 +222,8 @@ final class SSHClientSession: Sendable {
     ) -> EventLoopFuture<Void> {
         let handshakeHandler = ClientHandshakeHandler(
             eventLoop: channel.eventLoop,
-            loginTimeout: settings.loginTimeout
+            loginTimeout: settings.loginTimeout,
+            onEvent: settings.onHandshakeEvent
         )
         var clientConfiguration = SSHClientConfiguration(
             userAuthDelegate: settings.authenticationMethod(),
@@ -299,7 +328,8 @@ final class SSHClientSession: Sendable {
         channelHandlers: [ChannelHandler] = [],
         connectTimeout: TimeAmount = .seconds(30),
         loginTimeout: TimeAmount = .seconds(10),
-        onChannel: (@Sendable (Channel) -> Void)? = nil
+        onChannel: (@Sendable (Channel) -> Void)? = nil,
+        onHandshakeEvent: (@Sendable (SSHHandshakeEvent) -> Void)? = nil
     ) async throws -> SSHClientSession {
         var settings = SSHClientSettings(
             host: host,
@@ -315,6 +345,7 @@ final class SSHClientSession: Sendable {
         settings.connectTimeout = connectTimeout
         settings.loginTimeout = loginTimeout
         settings.onChannel = onChannel
+        settings.onHandshakeEvent = onHandshakeEvent
 
         return try await connect(
             settings: settings

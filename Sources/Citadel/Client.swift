@@ -290,6 +290,7 @@ public final class SSHClient {
     /// - onChannel: Receives the `Channel` before the TCP connect completes, so the caller can abort an
     ///   in-flight handshake with `channel.close()` (NIO's connect ignores Task cancellation). May fire
     ///   more than once (Happy Eyeballs). See `SSHClientSettings.onChannel`.
+    /// - onHandshakeEvent: Handshake milestones (TCP up / banner / authenticated) for progress UI.
     /// - Returns: An SSH client. On ANY failure after the TCP connect the underlying channel has
     ///   already been closed — nothing is left half-open on the server.
     public static func connect(
@@ -304,7 +305,8 @@ public final class SSHClient {
         channelHandlers: [ChannelHandler] = [],
         connectTimeout:TimeAmount = .seconds(30),
         loginTimeout: TimeAmount = .seconds(10),
-        onChannel: (@Sendable (Channel) -> Void)? = nil
+        onChannel: (@Sendable (Channel) -> Void)? = nil,
+        onHandshakeEvent: (@Sendable (SSHHandshakeEvent) -> Void)? = nil
     ) async throws -> SSHClient {
         let session = try await SSHClientSession.connect(
             host: host,
@@ -317,7 +319,8 @@ public final class SSHClient {
             channelHandlers: channelHandlers,
             connectTimeout: connectTimeout,
             loginTimeout: loginTimeout,
-            onChannel: onChannel
+            onChannel: onChannel,
+            onHandshakeEvent: onHandshakeEvent
         )
         
         let client = SSHClient(
